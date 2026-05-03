@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# SQLite database
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Node
+node_modules/
+frontend/dist/
+
+# TradingAgents cache & logs
+~/.tradingagents/
