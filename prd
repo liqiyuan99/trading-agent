@@ -1,0 +1,312 @@
+# StockResearch — Product Requirements Document
+
+> For use with Claude Code  
+> Version 1.0 | Personal use, self-hosted on Synology DS218+
+
+-----
+
+## 1. Overview
+
+StockResearch is a personal, self-hosted web application that wraps the TradingAgents multi-agent framework into a clean UI. It allows the user to submit stock research requests, run AI-powered analysis via the Gemini Flash API, and browse a persistent history of past research runs — all hosted on a Synology DS218+ NAS via Docker.
+
+-----
+
+## 2. Goals
+
+- Run TradingAgents analysis on any stock ticker with minimal friction
+- Default to “today minus 3 days” as the analysis date, with full custom date support
+- Persist every research run to a local SQLite database
+- Browse, search, and re-read past runs without re-running (and re-paying) the API
+- Deploy as a Docker Compose stack on Synology DS218+
+
+-----
+
+## 3. Non-Goals
+
+- No multi-user support — single user only, no auth required
+- No live trading or brokerage integration
+- No real-time stock price feeds
+- No mobile-native app — responsive web is sufficient
+- No sector-level screening (single ticker analysis only)
+
+-----
+
+## 4. Tech Stack
+
+|Layer           |Choice                        |Reason                                           |
+|----------------|------------------------------|-------------------------------------------------|
+|Backend         |Python 3.11 + FastAPI         |Async-friendly, good for long-running jobs       |
+|AI Framework    |TradingAgents (TauricResearch)|Core analysis engine                             |
+|LLM             |Google Gemini Flash via API   |User’s existing API key, cost-efficient          |
+|Database        |SQLite via SQLModel           |Zero-setup, single file, easy Synology backup    |
+|Background jobs |FastAPI BackgroundTasks       |Simple enough for single-user; no Celery overhead|
+|Frontend        |React (Vite) + Tailwind CSS   |Lightweight, single-page                         |
+|Containerisation|Docker Compose                |Synology Docker support                          |
+
+-----
+
+## 5. Environment Variables
+
+All secrets and config live in a `.env` file at project root. Never commit this file.
+
+```
+GEMINI_API_KEY=your_key_here
+TRADINGAGENTS_LLM_PROVIDER=google
+TRADINGAGENTS_LLM_MODEL=gemini-2.5-flash
+DATABASE_URL=sqlite:///./data/stockresearch.db
+DEFAULT_DATE_OFFSET_DAYS=3
+APP_PORT=8000
+```
+
+-----
+
+## 6. Data Model
+
+### `research_runs` table
+
+|Column         |Type      |Notes                                                      |
+|---------------|----------|-----------------------------------------------------------|
+|id             |INTEGER PK|Auto-increment                                             |
+|ticker         |TEXT      |Uppercase, e.g. “NVDA”                                     |
+|analysis_date  |DATE      |Date passed to TradingAgents                               |
+|run_timestamp  |DATETIME  |When the run was initiated                                 |
+|status         |TEXT      |`pending` / `running` / `complete` / `failed`              |
+|recommendation |TEXT      |`Buy` / `Overweight` / `Hold` / `Underweight` / `Sell`     |
+|confidence     |TEXT      |As returned by TradingAgents if available                  |
+|analyst_reports|JSON      |Full per-agent reports (fundamentals, sentiment, technical)|
+|final_report   |TEXT      |Trader’s final investment thesis                           |
+|risk_assessment|JSON      |Risk team output                                           |
+|model_used     |TEXT      |Model string used for the run                              |
+|error_message  |TEXT      |Populated on failure                                       |
+
+-----
+
+## 7. API Endpoints
+
+### POST `/api/runs`
+
+Start a new research run.
+
+**Request body:**
+
+```json
+{
+  "ticker": "NVDA",
+  "analysis_date": "2026-04-30"  // optional, defaults to today - DEFAULT_DATE_OFFSET_DAYS
+}
+```
+
+**Response:**
+
+```json
+{
+  "run_id": 42,
+  "status": "pending"
+}
+```
+
+### GET `/api/runs`
+
+List all past runs, newest first.
+
+**Query params:** `?ticker=NVDA` (optional filter), `?limit=50&offset=0`
+
+**Response:** Array of run summaries (id, ticker, analysis_date, run_timestamp, status, recommendation)
+
+### GET `/api/runs/{run_id}`
+
+Get full detail of a single run including all agent reports.
+
+### DELETE `/api/runs/{run_id}`
+
+Delete a run from history.
+
+### GET `/api/runs/{run_id}/status`
+
+Poll for status of an in-progress run. Returns `{ status, progress_message }`.
+
+### GET `/api/health`
+
+Basic health check. Returns `{ status: "ok" }`.
+
+-----
+
+## 8. Frontend Pages & Components
+
+### 8.1 New Analysis Page (default/home)
+
+- **Ticker input** — text field, auto-uppercases, validates against basic format (1–5 letters)
+- **Date picker** — defaults to today minus `DEFAULT_DATE_OFFSET_DAYS`, user can override to any past date. Future dates not selectable.
+- **Run button** — submits the request, disables during run
+- **Progress indicator** — polls `/api/runs/{id}/status` every 5 seconds, shows current agent activity message (e.g. “Fundamental analyst working…”)
+- **Result card** — appears inline when run completes, showing recommendation badge + summary thesis. Link to full report.
+
+### 8.2 History Page
+
+- **Runs table** — columns: Ticker, Analysis Date, Run Date, Recommendation (colour-coded badge), Actions
+- **Search/filter** — filter by ticker text input
+- **Click row** → opens Run Detail Page
+- **Delete button** per row with confirmation
+
+### 8.3 Run Detail Page
+
+- Header: Ticker, analysis date, recommendation badge, run timestamp
+- **Tabs:**
+  - **Summary** — final trader report / investment thesis (full text)
+  - **Fundamentals** — fundamental analyst report
+  - **Sentiment** — sentiment analyst report
+  - **Technical** — technical analyst report
+  - **Risk** — risk team assessment
+  - **Raw** — full JSON dump of stored data
+- Back button to History
+
+### 8.4 Settings Page (simple)
+
+- Display current model in use
+- Display default date offset (read from env, not editable in UI — user edits `.env`)
+- Link to Gemini API console
+
+-----
+
+## 9. Background Job Behaviour
+
+- On `POST /api/runs`, a run record is created immediately with `status=pending`
+- FastAPI BackgroundTasks picks it up and calls `TradingAgentsGraph.propagate(ticker, date)`
+- Status updates to `running` when the job starts
+- On success: status → `complete`, all fields populated
+- On failure: status → `failed`, `error_message` populated
+- Runs are **not queued** — if a run is already in `running` state, new submissions are accepted but will run concurrently. For personal use this is fine. Consider adding a warning in the UI if a run is already active.
+
+-----
+
+## 10. TradingAgents Integration
+
+Configure TradingAgents to use Gemini Flash by modifying `DEFAULT_CONFIG`:
+
+```python
+from tradingagents.default_config import DEFAULT_CONFIG
+
+config = DEFAULT_CONFIG.copy()
+config["llm_provider"] = "google"
+config["deep_think_llm"] = "gemini-2.5-flash"
+config["quick_think_llm"] = "gemini-2.5-flash"
+config["backend_url"] = ""  # not needed for Gemini
+
+ta = TradingAgentsGraph(debug=False, config=config)
+_, decision = ta.propagate(ticker, analysis_date_str)
+```
+
+The `decision` object should be parsed and mapped to the `research_runs` schema before saving.
+
+-----
+
+## 11. Docker Compose Setup
+
+```yaml
+version: "3.9"
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "${APP_PORT}:8000"
+    volumes:
+      - ./data:/app/data        # SQLite DB persists here
+    env_file: .env
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+```
+
+- SQLite file lives in `./data/` which should be mapped to a Synology shared folder for easy backup
+- No external database container needed
+
+-----
+
+## 12. Project Directory Structure
+
+```
+stockresearch/
+├── backend/
+│   ├── main.py              # FastAPI app, routes
+│   ├── models.py            # SQLModel data models
+│   ├── database.py          # DB init, session management
+│   ├── agent_runner.py      # TradingAgents wrapper
+│   ├── schemas.py           # Pydantic request/response schemas
+│   ├── requirements.txt
+│   └── Dockerfile
+├── frontend/
+│   ├── src/
+│   │   ├── pages/
+│   │   │   ├── NewAnalysis.jsx
+│   │   │   ├── History.jsx
+│   │   │   ├── RunDetail.jsx
+│   │   │   └── Settings.jsx
+│   │   ├── components/
+│   │   │   ├── RecommendationBadge.jsx
+│   │   │   ├── RunTable.jsx
+│   │   │   └── ProgressPoller.jsx
+│   │   └── App.jsx
+│   ├── package.json
+│   └── Dockerfile
+├── data/                    # SQLite DB lives here (gitignored)
+├── docker-compose.yml
+├── .env                     # Never commit
+└── .env.example             # Commit this
+```
+
+-----
+
+## 13. Error Handling
+
+|Scenario                  |Behaviour                                                                                                    |
+|--------------------------|-------------------------------------------------------------------------------------------------------------|
+|Gemini API rate limit hit |Status → `failed`, error message shown in UI with retry button                                               |
+|Invalid ticker            |TradingAgents returns error → caught, stored, shown in UI                                                    |
+|DS218+ loses power mid-run|Status stays `running` on restart — UI should show a “stale” warning for runs stuck in `running` for >30 mins|
+|Gemini API key missing    |App refuses to start, logs clear error message                                                               |
+
+-----
+
+## 14. Build Phases (suggested order for Claude Code)
+
+**Phase 1 — Backend core**
+
+- FastAPI app scaffold
+- SQLite + SQLModel setup
+- TradingAgents integration with Gemini config
+- `POST /api/runs` and `GET /api/runs/{id}/status` endpoints
+- Test via curl / httpie only
+
+**Phase 2 — Full backend API**
+
+- All remaining endpoints (list, detail, delete)
+- Error handling and status transitions
+- `.env` loading and validation on startup
+
+**Phase 3 — Frontend**
+
+- New Analysis page with progress polling
+- History page with filter
+- Run Detail page with tabs
+
+**Phase 4 — Docker**
+
+- Dockerfiles for both services
+- Docker Compose with volume mounts
+- Test full stack locally, then deploy to DS218+
+
+-----
+
+## 15. Out of Scope for v1 (possible future additions)
+
+- Email/push notifications when a long run completes
+- Watchlist — save tickers and re-run analysis on a schedule
+- Export run to PDF
+- Comparison view — two runs side by side
+- Sector batch analysis
