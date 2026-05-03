@@ -1,7 +1,7 @@
 # StockResearch — Product Requirements Document
 
-> For use with Claude Code  
-> Version 1.0 | Personal use, self-hosted on Synology DS218+
+> For use with Claude Code
+> Version 1.1 | Personal use, self-hosted on Synology DS218+
 
 -----
 
@@ -51,12 +51,14 @@ All secrets and config live in a `.env` file at project root. Never commit this 
 
 ```
 GEMINI_API_KEY=your_key_here
-TRADINGAGENTS_LLM_PROVIDER=google
-TRADINGAGENTS_LLM_MODEL=gemini-2.5-flash
 DATABASE_URL=sqlite:///./data/stockresearch.db
 DEFAULT_DATE_OFFSET_DAYS=3
 APP_PORT=8000
 ```
+
+`GEMINI_API_KEY` is automatically aliased to `GOOGLE_API_KEY` at startup — `langchain-google-genai` (used internally by TradingAgents) expects the latter. No manual renaming needed.
+
+Model selection (`deep_think_llm`, `quick_think_llm`) is persisted in the `app_config` database table and managed via `PATCH /api/config`, not via env vars.
 
 -----
 
@@ -64,20 +66,32 @@ APP_PORT=8000
 
 ### `research_runs` table
 
-|Column         |Type      |Notes                                                      |
-|---------------|----------|-----------------------------------------------------------|
-|id             |INTEGER PK|Auto-increment                                             |
-|ticker         |TEXT      |Uppercase, e.g. “NVDA”                                     |
-|analysis_date  |DATE      |Date passed to TradingAgents                               |
-|run_timestamp  |DATETIME  |When the run was initiated                                 |
-|status         |TEXT      |`pending` / `running` / `complete` / `failed`              |
-|recommendation |TEXT      |`Buy` / `Overweight` / `Hold` / `Underweight` / `Sell`     |
-|confidence     |TEXT      |As returned by TradingAgents if available                  |
-|analyst_reports|JSON      |Full per-agent reports (fundamentals, sentiment, technical)|
-|final_report   |TEXT      |Trader’s final investment thesis                           |
-|risk_assessment|JSON      |Risk team output                                           |
-|model_used     |TEXT      |Model string used for the run                              |
-|error_message  |TEXT      |Populated on failure                                       |
+|Column         |Type      |Notes                                                                    |
+|---------------|----------|-------------------------------------------------------------------------|
+|id             |INTEGER PK|Auto-increment                                                           |
+|ticker         |TEXT      |Uppercase, e.g. “NVDA”                                                   |
+|analysis_date  |DATE      |Date passed to TradingAgents                                             |
+|run_timestamp  |DATETIME  |When the run was initiated (UTC)                                         |
+|started_at     |DATETIME  |When the background job actually began executing (UTC); used for stale detection|
+|status         |TEXT      |`pending` / `running` / `complete` / `failed`                            |
+|recommendation |TEXT      |`Buy` / `Overweight` / `Hold` / `Underweight` / `Sell`                   |
+|analyst_reports|JSON      |`{ fundamentals, sentiment, news, technical }` — sourced from `final_state`|
+|final_report   |TEXT      |Full Portfolio Manager decision (markdown); includes executive summary, investment thesis, price target, time horizon|
+|risk_assessment|JSON      |`risk_debate_state` from `final_state` — aggressive / conservative / neutral histories + judge decision|
+|model_used     |TEXT      |`”deep=<model>, quick=<model>”` — records the two models used for the run|
+|error_message  |TEXT      |Populated on failure (truncated traceback)                               |
+
+> **Note:** `confidence` was removed. TradingAgents’ `PortfolioDecision` schema has no confidence field. Relevant detail is captured in `final_report` instead.
+
+### `app_config` table (singleton, id = 1)
+
+|Column        |Type |Default          |Notes                              |
+|--------------|-----|-----------------|-----------------------------------|
+|id            |INTEGER PK|1           |Always 1 — single config row       |
+|deep_think_llm|TEXT |`gemini-2.5-pro` |Model for complex reasoning agents |
+|quick_think_llm|TEXT|`gemini-2.5-flash`|Model for faster utility agents   |
+
+SQLite is run in **WAL mode** (`PRAGMA journal_mode=WAL`) to allow safe concurrent reads during background writes.
 
 -----
 
@@ -129,6 +143,36 @@ Poll for status of an in-progress run. Returns `{ status, progress_message }`.
 
 Basic health check. Returns `{ status: "ok" }`.
 
+### GET `/api/config`
+
+Returns current model configuration and allowed model options.
+
+**Response:**
+
+```json
+{
+  "deep_think_llm": "gemini-2.5-pro",
+  "quick_think_llm": "gemini-2.5-flash",
+  "default_date_offset_days": 3,
+  "allowed_models": ["gemini-2.5-flash", "gemini-2.5-pro"]
+}
+```
+
+### PATCH `/api/config`
+
+Update deep and/or quick model selection. Both fields are optional — send only what you want to change.
+
+**Request body:**
+
+```json
+{
+  "deep_think_llm": "gemini-2.5-pro",
+  "quick_think_llm": "gemini-2.5-flash"
+}
+```
+
+**Response:** Same shape as `GET /api/config`. Returns 422 if an unknown model name is supplied.
+
 -----
 
 ## 8. Frontend Pages & Components
@@ -160,10 +204,11 @@ Basic health check. Returns `{ status: "ok" }`.
   - **Raw** — full JSON dump of stored data
 - Back button to History
 
-### 8.4 Settings Page (simple)
+### 8.4 Settings Page
 
-- Display current model in use
-- Display default date offset (read from env, not editable in UI — user edits `.env`)
+- **Deep think model** — dropdown (`gemini-2.5-pro` / `gemini-2.5-flash`); used by complex reasoning agents (Portfolio Manager, Risk team). Calls `PATCH /api/config` on change.
+- **Quick think model** — dropdown (`gemini-2.5-flash` / `gemini-2.5-pro`); used by faster utility agents. Calls `PATCH /api/config` on change.
+- **Default date offset** — read-only display sourced from `GET /api/config`; user edits `.env` to change it.
 - Link to Gemini API console
 
 -----
@@ -181,29 +226,45 @@ Basic health check. Returns `{ status: "ok" }`.
 
 ## 10. TradingAgents Integration
 
-Configure TradingAgents to use Gemini Flash by modifying `DEFAULT_CONFIG`:
+Configure TradingAgents to use Gemini by modifying `DEFAULT_CONFIG`. Model names come from the `app_config` table at runtime:
 
 ```python
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 config = DEFAULT_CONFIG.copy()
 config["llm_provider"] = "google"
-config["deep_think_llm"] = "gemini-2.5-flash"
-config["quick_think_llm"] = "gemini-2.5-flash"
+config["deep_think_llm"] = app_config.deep_think_llm   # from app_config table
+config["quick_think_llm"] = app_config.quick_think_llm  # from app_config table
 config["backend_url"] = ""  # not needed for Gemini
 
 ta = TradingAgentsGraph(debug=False, config=config)
-_, decision = ta.propagate(ticker, analysis_date_str)
+final_state, decision = ta.propagate(ticker, analysis_date_str)
 ```
 
-The `decision` object should be parsed and mapped to the `research_runs` schema before saving.
+### Return value mapping
+
+`propagate()` returns `(final_state, decision)`:
+
+- `decision` — plain string: one of `Buy / Overweight / Hold / Underweight / Sell`. Maps to `recommendation`.
+- `final_state` — full `AgentState` dict. All rich data lives here:
+
+| `research_runs` column | Source in `final_state` |
+|---|---|
+| `recommendation` | `decision` (second return value) |
+| `analyst_reports` | `{ fundamentals: final_state["fundamentals_report"], sentiment: final_state["sentiment_report"], news: final_state["news_report"], technical: final_state["market_report"] }` |
+| `final_report` | `final_state["final_trade_decision"]` — rendered markdown from `PortfolioDecision` |
+| `risk_assessment` | `final_state["risk_debate_state"]` — contains aggressive / conservative / neutral histories |
+
+### Supported Gemini models
+
+Only `gemini-2.5-flash` and `gemini-2.5-pro` are offered in the UI. Both are first-class entries in TradingAgents' model catalog and use `langchain-google-genai` (`ChatGoogleGenerativeAI`) under the hood.
 
 -----
 
 ## 11. Docker Compose Setup
 
 ```yaml
-version: "3.9"
 services:
   backend:
     build: ./backend
@@ -217,14 +278,16 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "3000:3000"
+      - "3000:80"
     depends_on:
       - backend
     restart: unless-stopped
 ```
 
-- SQLite file lives in `./data/` which should be mapped to a Synology shared folder for easy backup
-- No external database container needed
+- SQLite file lives in `./data/` which should be mapped to a Synology shared folder for easy backup.
+- No external database container needed.
+- The frontend Dockerfile uses a multi-stage build: `node` stage compiles the Vite app, `nginx:alpine` serves the static output. The nginx config proxies `/api/*` requests to the backend container, avoiding CORS entirely.
+- The `version:` key is omitted — it is deprecated and ignored in Docker Compose v2+.
 
 -----
 
@@ -268,37 +331,41 @@ stockresearch/
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
 |Gemini API rate limit hit |Status → `failed`, error message shown in UI with retry button                                               |
 |Invalid ticker            |TradingAgents returns error → caught, stored, shown in UI                                                    |
-|DS218+ loses power mid-run|Status stays `running` on restart — UI should show a “stale” warning for runs stuck in `running` for >30 mins|
-|Gemini API key missing    |App refuses to start, logs clear error message                                                               |
+|DS218+ loses power mid-run|On next startup, any run still in `running` state is immediately marked `failed` with message “Server restarted while this run was in progress.” The `started_at` column is available if finer-grained stale detection is needed in future.|
+|Gemini API key missing    |App refuses to start (`GEMINI_API_KEY` / `GOOGLE_API_KEY` checked in lifespan hook), logs clear error message|
+|Future date submitted     |`POST /api/runs` returns HTTP 422 — analysis_date cannot be in the future                                    |
 
 -----
 
 ## 14. Build Phases (suggested order for Claude Code)
 
-**Phase 1 — Backend core**
+**Phase 1 — Backend core ✅ complete**
 
-- FastAPI app scaffold
-- SQLite + SQLModel setup
-- TradingAgents integration with Gemini config
+- FastAPI app scaffold with lifespan startup validation
+- SQLite + SQLModel setup (WAL mode, `ResearchRun` + `AppConfig` tables)
+- TradingAgents integration with Gemini config; correct `final_state` field mapping
 - `POST /api/runs` and `GET /api/runs/{id}/status` endpoints
-- Test via curl / httpie only
+- `GET /api/config` and `PATCH /api/config` endpoints for model switcher
+- Stale run reset on startup
 
 **Phase 2 — Full backend API**
 
-- All remaining endpoints (list, detail, delete)
-- Error handling and status transitions
-- `.env` loading and validation on startup
+- `GET /api/runs` — list with ticker filter and pagination
+- `GET /api/runs/{run_id}` — full run detail
+- `DELETE /api/runs/{run_id}` — delete from history
 
 **Phase 3 — Frontend**
 
 - New Analysis page with progress polling
 - History page with filter
 - Run Detail page with tabs
+- Settings page with deep/quick model dropdowns (calls `PATCH /api/config`)
 
 **Phase 4 — Docker**
 
-- Dockerfiles for both services
-- Docker Compose with volume mounts
+- Backend Dockerfile
+- Frontend Dockerfile (multi-stage: Vite build → nginx:alpine serve; nginx proxies `/api/*` to backend)
+- Docker Compose with volume mounts (no `version:` key)
 - Test full stack locally, then deploy to DS218+
 
 -----
