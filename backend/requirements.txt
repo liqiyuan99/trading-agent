@@ -3,4 +3,5 @@ uvicorn[standard]>=0.32.0
 sqlmodel>=0.0.22
 python-dotenv>=1.0.0
 APScheduler>=3.10.0
+python-multipart>=0.0.9
 tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@v0.2.5
