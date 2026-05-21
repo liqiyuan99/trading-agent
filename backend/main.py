@@ -7,15 +7,16 @@ from typing import List, Optional
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlmodel import Session, select
 
 import scheduler as sched
 from agent_runner import run_analysis
+from auth import AuthMiddleware, login_page_html
 from database import engine, get_session, init_db
 from emailer import is_configured as email_is_configured
 from models import ResearchRun, ScheduledRun
@@ -93,12 +94,28 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="StockResearch API", version="1.0.0", lifespan=lifespan)
 
+app.add_middleware(AuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/login", include_in_schema=False)
+def get_login():
+    return login_page_html()
+
+
+@app.post("/login", include_in_schema=False)
+async def post_login(password: str = Form(...)):
+    from auth import COOKIE_NAME, _expected_token
+    if password == os.getenv("APP_PASSWORD", ""):
+        response = RedirectResponse(url="/", status_code=303)
+        response.set_cookie(COOKIE_NAME, _expected_token(), httponly=True, samesite="lax")
+        return response
+    return login_page_html(error=True)
 
 
 # ---------------------------------------------------------------------------
