@@ -1,0 +1,13 @@
+services:
+  stockresearch:
+    build: .
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - stockresearch_data:/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  stockresearch_data:
